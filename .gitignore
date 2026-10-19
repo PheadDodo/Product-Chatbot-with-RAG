@@ -1,0 +1,12 @@
+/data/
+/tmp/
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+.env.*
+!.env.example
+*.gguf
+*.safetensors
+candidate-brief.md
