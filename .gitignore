@@ -1,5 +1,6 @@
 /data/
 /tmp/
+/models/
 __pycache__/
 *.py[cod]
 .venv/
@@ -10,3 +11,5 @@ venv/
 *.gguf
 *.safetensors
 candidate-brief.md
+AGENTS.md
+WORKFLOW.md
