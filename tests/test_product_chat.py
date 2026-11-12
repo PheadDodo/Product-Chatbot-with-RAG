@@ -51,12 +51,14 @@ class ProductChatTests(unittest.TestCase):
         self.rewrite_error = None
         self.rewrite_finish_reason = "stop"
         self.generation_error = None
+        self.generation_finish_reason = "stop"
         self.closing_error = None
         self.closing_failure_at = 1
         self.no_results = False
         self.load_attempts = 0
         self.loaded_models = []
         self.completion_models = []
+        self.prompt_token_count = 10
         self.dll_directory_open = False
         owner = self
 
@@ -85,11 +87,12 @@ class ProductChatTests(unittest.TestCase):
             def close(self):
                 owner.events.append("retriever-closed")
 
-        def isolated_retrieval_stub(query, top_k, verbose, on_start):
+        def isolated_retrieval_stub(query, top_k, verbose, on_start, timeout_seconds):
             # Actual subprocess/JSON transfer is covered by worker tests. Here
             # retain real retrieval/logging code with fake model backends.
             if on_start is not None:
                 on_start(12345)
+            owner.assertEqual(timeout_seconds, 180.0)
             return product_rag.retrieve(query, top_k=top_k, verbose=verbose)
 
         class LlamaStub:
@@ -101,9 +104,19 @@ class ProductChatTests(unittest.TestCase):
                     owner.events.append("llm-load-failed")
                     raise owner.loading_error
                 self.closed = False
+                self.context_capacity = kwargs["n_ctx"]
                 self.index = owner.load_attempts
                 owner.loaded_models.append(self)
                 owner.events.append("llm-loaded")
+
+            def tokenize(self, text, *, add_bos, special):
+                owner.assertIsInstance(text, bytes)
+                owner.assertTrue(add_bos)
+                owner.assertTrue(special)
+                return [1] * owner.prompt_token_count
+
+            def n_ctx(self):
+                return self.context_capacity
 
             def create_completion(self, **kwargs):
                 owner.assertFalse(self.closed)
@@ -128,7 +141,8 @@ class ProductChatTests(unittest.TestCase):
                     owner.assertEqual(kwargs["max_tokens"], 1024)
                     if owner.generation_error:
                         raise owner.generation_error
-                    text, finish_reason = "Grounded stub answer.", "stop"
+                    text = "Grounded stub answer."
+                    finish_reason = owner.generation_finish_reason
                 return {
                     "choices": [{"text": text, "finish_reason": finish_reason}],
                     "usage": {"prompt_tokens": 123, "completion_tokens": 8, "total_tokens": 131},
@@ -155,14 +169,25 @@ class ProductChatTests(unittest.TestCase):
         backend.Llama = LlamaStub
         stack = ExitStack()
         self.addCleanup(stack.close)
-        stack.enter_context(patch.dict(os.environ))
+        cuda_directory = self.directory / "cuda" / "bin" / "x64"
+        cuda_directory.mkdir(parents=True)
+        stack.enter_context(patch.dict(os.environ, {
+            "RAG_MODEL_PATH": str(self.model_path),
+            "RAG_CUDA_BIN_DIR": str(cuda_directory),
+            "RAG_N_GPU_LAYERS": "52", "RAG_N_CTX": "10000",
+            "RAG_N_BATCH": "512", "RAG_N_UBATCH": "128",
+            "RAG_MAX_OUTPUT_TOKENS": "1024",
+            "RAG_RETRIEVAL_TIMEOUT_SECONDS": "180",
+            "RAG_MAX_QUESTION_CHARS": "8000",
+        }))
         stack.enter_context(redirect_stdout(io.StringIO()))
-        stack.enter_context(patch.multiple(
-            product_chat,
-            ANSWER_PATH=self.answer_path,
-            QUERY_PATH=self.query_path,
-            RUN_PATH=self.run_path,
-            create=True,
+        stack.enter_context(patch.object(product_chat, "LOCK_PATH", self.directory / "tmp/product-chat.lock"))
+        stack.enter_context(patch.object(
+            product_chat, "create_run_artifacts", return_value=types.SimpleNamespace(
+                directory=self.directory, answer_path=self.answer_path,
+                prompt_path=self.prompt_path, query_path=self.query_path,
+                run_path=self.run_path,
+            ),
         ))
         stack.enter_context(patch.object(product_rag, "project_dir", self.directory))
         stack.enter_context(patch.object(product_rag, "load_processed_records", return_value=self.records))
@@ -170,7 +195,6 @@ class ProductChatTests(unittest.TestCase):
         stack.enter_context(patch.object(product_chat, "retrieve", side_effect=isolated_retrieval_stub))
         stack.enter_context(patch.multiple(
             load_llm,
-            MODEL_PATH=self.model_path,
             PROMPT_PATH=self.prompt_path,
             ANSWER_PATH=self.answer_path,
         ))
@@ -320,6 +344,134 @@ class ProductChatTests(unittest.TestCase):
             with self.subTest(question=question):
                 with self.assertRaisesRegex(ValueError, "Question cannot be empty"):
                     product_chat.answer_question(question)
+        self.assertEqual(self.events, [])
+
+    def test_incomplete_answer_is_rejected_and_marks_the_run_failed(self):
+        for reason in ("length", "content_filter", None):
+            with self.subTest(finish_reason=reason):
+                self.events.clear()
+                self.loaded_models.clear()
+                self.generation_finish_reason = reason
+                self.answer_path.write_text("Old successful answer", encoding="utf-8")
+                with self.assertRaisesRegex(ValueError, "answer did not finish normally"):
+                    product_chat.answer_question(self.question)
+                self.assertEqual(self.events[-2:], ["generated", "llm-closed"])
+                run = self.assert_failed_run("answer did not finish normally")
+                self.assertEqual(run["stage"], "generation")
+                self.assertNotIn(
+                    "Run status: COMPLETED", self.answer_path.read_text(encoding="utf-8"),
+                )
+
+    def test_oversized_question_is_rejected_before_creating_a_run_or_loading_models(self):
+        with patch.dict(os.environ, {"RAG_MAX_QUESTION_CHARS": "5"}):
+            for rewrite in (True, False):
+                with self.subTest(rewrite=rewrite):
+                    with self.assertRaisesRegex(ValueError, "character limit"):
+                        product_chat.answer_question(self.question, rewrite_query=rewrite)
+        self.assertEqual(self.events, [])
+        product_chat.create_run_artifacts.assert_not_called()
+
+    def test_model_configuration_stays_the_same_across_all_phases(self):
+        retrieve = product_chat.retrieve
+
+        def change_environment_after_retrieval(*args, **kwargs):
+            records = retrieve(*args, **kwargs)
+            os.environ["RAG_MODEL_PATH"] = str(self.directory / "changed-missing.gguf")
+            os.environ["RAG_MAX_OUTPUT_TOKENS"] = "2000"
+            return records
+
+        with patch.object(product_chat, "retrieve", side_effect=change_environment_after_retrieval):
+            answer = product_chat.answer_question(self.question)
+        self.assertEqual(answer, "Grounded stub answer.")
+        self.assertEqual(len(self.loaded_models), 2)
+        self.assertIn(str(self.model_path), self.answer_path.read_text(encoding="utf-8"))
+        configuration = self.read_json(self.run_path)["configuration"]
+        self.assertEqual(configuration["model_path"], str(self.model_path))
+        self.assertEqual(configuration["max_output_tokens"], 1024)
+
+    def test_query_prompt_budget_prevents_completion_and_closes_model(self):
+        self.prompt_token_count = 10000
+        with self.assertRaisesRegex(ValueError, "context window"):
+            product_chat.answer_question(self.question)
+        self.assertEqual(self.events, ["llm-loaded", "llm-closed"])
+        self.assert_failed_run("context window")
+
+    def test_answer_prompt_budget_prevents_completion_and_closes_model(self):
+        self.prompt_token_count = 9000
+        self.expected_retrieval_query = self.question
+        with self.assertRaisesRegex(ValueError, "context window"):
+            product_chat.answer_question(self.question, rewrite_query=False)
+        self.assertNotIn("generated", self.events)
+        self.assertEqual(self.events[-2:], ["llm-loaded", "llm-closed"])
+        self.assert_failed_run("context window")
+
+    def test_model_dll_environment_is_restored_after_cleanup(self):
+        previous = {key: os.environ.get(key) for key in ("PATH", "CUDA_PATH")}
+        with load_llm.load_model():
+            self.assertNotEqual(os.environ["PATH"], previous["PATH"])
+        self.assertEqual(
+            {key: os.environ.get(key) for key in ("PATH", "CUDA_PATH")}, previous,
+        )
+
+    def test_arbitrary_dll_directory_does_not_invent_a_cuda_sdk_root(self):
+        directory = self.directory / "native-libraries"
+        directory.mkdir()
+        with patch.dict(os.environ, {
+            "RAG_CUDA_BIN_DIR": str(directory), "CUDA_PATH": "existing-cuda-root",
+        }):
+            with load_llm.load_model():
+                self.assertEqual(os.environ["CUDA_PATH"], "existing-cuda-root")
+
+    def test_standalone_generation_interruption_closes_model_and_marks_failed(self):
+        self.generation_error = KeyboardInterrupt()
+        with self.assertRaises(KeyboardInterrupt):
+            load_llm.generate_answer(self.question, [{**self.records[0], "score": 0.75}])
+        self.assertEqual(self.events[-2:], ["generated", "llm-closed"])
+        self.assertIn("Run status: FAILED", self.answer_path.read_text(encoding="utf-8"))
+
+    def test_sequential_runs_preserve_distinct_question_prompt_answer_and_status_files(self):
+        from run_artifacts import create_run_artifacts
+
+        runs_root = self.directory / "runs"
+        with patch.object(product_chat, "RUNS_DIR", runs_root):
+            with patch.object(product_chat, "create_run_artifacts", side_effect=create_run_artifacts):
+                product_chat.answer_question(self.question)
+                first_run = next(runs_root.iterdir())
+                saved = {path.name: path.read_bytes() for path in first_run.iterdir()}
+                product_chat.answer_question(self.question)
+        runs = list(runs_root.iterdir())
+        self.assertEqual(len(runs), 2)
+        self.assertEqual(saved, {path.name: path.read_bytes() for path in first_run.iterdir()})
+        for directory in runs:
+            report = self.read_json(directory / "run.json")
+            self.assertEqual(report["status"], "COMPLETED")
+            self.assertEqual(report["run_id"], directory.name)
+            self.assertEqual(self.read_json(directory / "query.json")["original_question"], self.question)
+            self.assertIn(self.records[0]["text"], (directory / "llm-prompt.txt").read_text(encoding="utf-8"))
+            self.assertIn("Grounded stub answer.", (directory / "llm-answer.txt").read_text(encoding="utf-8"))
+        self.assertFalse(self.answer_path.exists())
+        self.assertFalse(self.prompt_path.exists())
+
+    def test_busy_local_job_is_rejected_before_any_model_is_loaded(self):
+        from run_artifacts import exclusive_job
+
+        with exclusive_job(product_chat.LOCK_PATH):
+            with self.assertRaisesRegex(RuntimeError, "already running"):
+                product_chat.answer_question(self.question)
+        self.assertEqual(self.events, [])
+        self.assertEqual(product_chat.answer_question(self.question), "Grounded stub answer.")
+
+    def test_legacy_native_cli_entry_points_share_the_primary_job_lock(self):
+        from run_artifacts import exclusive_job
+
+        with patch.object(load_llm, "PROJECT_DIR", self.directory):
+            with exclusive_job(product_chat.LOCK_PATH):
+                with patch("builtins.input") as enter_question:
+                    for invoke in (load_llm.main, product_rag.main):
+                        with self.subTest(entry_point=invoke.__module__):
+                            with self.assertRaisesRegex(RuntimeError, "already running"):
+                                invoke()
+                    enter_question.assert_not_called()
         self.assertEqual(self.events, [])
 
     def test_formatter_rejects_missing_page_metadata_before_loading_answer_model(self):

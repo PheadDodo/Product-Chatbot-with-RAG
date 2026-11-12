@@ -59,7 +59,7 @@ class BuildPassagesTests(unittest.TestCase):
             make_item(10, "The AC filter is an ideal choice."),
             make_item(11, "AC filter is designed for smaller side streams."),
             make_item(12, "Led by experience", "section_header"),
-            make_item(13, "Metso has a comprehensive filtration portfolio."),
+            make_item(13, "The supplier has a comprehensive filtration portfolio."),
         ]
         records = [make_record(item) for item in items]
 

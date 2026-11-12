@@ -362,8 +362,11 @@ def run_query(query):
 
 
 def main():
-    query = input("Enter your question: ")
-    run_query(query)
+    from run_artifacts import exclusive_job
+
+    with exclusive_job(project_dir / "tmp/product-chat.lock"):
+        query = input("Enter your question: ")
+        run_query(query)
 
 
 if __name__ == "__main__":
